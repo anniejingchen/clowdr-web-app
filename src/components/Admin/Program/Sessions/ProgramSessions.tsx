@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef, useContext, useEffect } from 'react';
 import { Button, DatePicker, Form, Input, Popconfirm, Select, Space, Spin, Table } from "antd";
 import Parse from "parse";
 import { AuthUserContext } from "../../../Session";
@@ -30,6 +30,7 @@ interface ProgramSessionsState {
     ProgramRooms: Parse.Object[];
     ProgramItems: Parse.Object[];
     searchResult: Parse.Object[];
+    ProgramSessionEvents: Parse.Object[];
     alert: string;
     visible: boolean
 }
@@ -45,6 +46,7 @@ class ProgramSessions extends React.Component<ProgramSessionsProps, ProgramSessi
             ProgramSessions: [],
             ProgramRooms: [],
             ProgramItems: [],
+            ProgramSessionEvents: [],
             searchResult: [],
             alert: "",
             visible: false
@@ -56,15 +58,17 @@ class ProgramSessions extends React.Component<ProgramSessionsProps, ProgramSessi
     }
 
     async componentDidMount() {
-        let [sessions, rooms, items] = await Promise.all([
+        let [sessions, rooms, items, events] = await Promise.all([
             this.props.auth.programCache.getProgramSessions(this),
             this.props.auth.programCache.getProgramRooms(this),
             this.props.auth.programCache.getProgramItems(this),
+            this.props.auth.programCache.getProgramSessionEvents(this)
         ]);
         this.setState({
             ProgramSessions: sessions,
             ProgramRooms: rooms,
             ProgramItems: items,
+            ProgramSessionEvents: events,
             loading: false
         });
     }
@@ -73,6 +77,7 @@ class ProgramSessions extends React.Component<ProgramSessionsProps, ProgramSessi
         this.props.auth.programCache.cancelSubscription("ProgramSession", this, undefined);
         this.props.auth.programCache.cancelSubscription("ProgramItem", this, undefined);
         this.props.auth.programCache.cancelSubscription("ProgramRoom", this, undefined);
+        this.props.auth.programCache.cancelSubscription("ProgramSessionEvent", this, undefined);  // ??
     }
 
     onCreate = () => {
@@ -273,6 +278,8 @@ class ProgramSessions extends React.Component<ProgramSessionsProps, ProgramSessi
                         }
                         if (newItems.length > 0)
                             data.items = newItems.map((i: Parse.Object) => { return { clazz: "ProgramItem", id: i.id } })
+
+                        console.log(data);
                         Parse.Cloud.run("update-obj", data)
                             .then(() => {
                                 this.setState({ alert: "save success" });
@@ -354,11 +361,12 @@ class ProgramSessions extends React.Component<ProgramSessionsProps, ProgramSessi
                     width: '25%',
                     editable: true,
                     render: (_: string, record: Parse.Object): JSX.Element => {
-                        if (record.get("items")) {
+                        if (record.get("events")) {
+                            const curEvents = record.get("events").sort((a:Parse.Object, b:Parse.Object) => a.get("startTime") - b.get("startTime"));
                             return <ul>{
-                                record.get("items").map((item: Parse.Object) => (
-                                    <li key={item.id}>
-                                        {item.get('title')}
+                                curEvents.map((event: Parse.Object) => (
+                                    <li key={event.id}>
+                                        <span>{event.get('programItem').get('title')} {timezone(event.get("startTime")).tz(timezone.tz.guess()).format("HH:mm z")}</span>
                                     </li>
                                 ))
                             }</ul>
@@ -430,6 +438,211 @@ class ProgramSessions extends React.Component<ProgramSessionsProps, ProgramSessi
                 };
             });
 
+            const expandedRowRender = (outterRecord:any) => {
+                //@ts-ignore
+                const EditableContext = React.createContext<any>();
+
+                interface Item {
+                    key: string;
+                    item: string;
+                    startTime: Date;
+                    endTime: Date;
+                }
+                  
+                interface EditableRowProps {
+                    index: number;
+                }
+                  
+                const EditableRow: React.FC<EditableRowProps> = ({ index, ...props }) => {
+                const [form] = Form.useForm();
+                    return (
+                        <Form form={form} component={false}>
+                            <EditableContext.Provider value={form}>
+                                <tr {...props} />
+                            </EditableContext.Provider>
+                        </Form>
+                    );
+                };
+                  
+                interface EditableCellProps {
+                    title: React.ReactNode;
+                    editable: boolean;
+                    children: React.ReactNode;
+                    dataIndex: string;
+                    record: Item;
+                    handleSave: (record: Item) => void;
+                }
+                  
+                const EditableCell: React.FC<EditableCellProps> = ({
+                    title,
+                    editable,
+                    children,
+                    dataIndex,
+                    record,
+                    handleSave,
+                    ...restProps
+                }) => {
+                    const [editing, setEditing] = useState(false);
+                    const inputRef = useRef();
+                    const form = useContext(EditableContext);
+                  
+                    const toggleEdit = () => {
+                        setEditing(!editing);
+                        //@ts-ignore
+                        form.setFieldsValue({ [dataIndex]: record[dataIndex] });
+                    };
+                  
+                    const save = async (e: any) => {
+                        try {
+                            const values = await form.validateFields();
+                            toggleEdit();
+                            handleSave({ ...record, ...values });
+                        } catch (errInfo) {
+                            console.log('Save failed:', errInfo);
+                        }
+                    };
+                  
+                    let childNode = children;
+                  
+                    if (editable) {
+                        childNode = editing ? (
+                            <Form.Item
+                                style={{ margin: 0 }}
+                                name={dataIndex}
+                                rules={[
+                                    {
+                                        required: true,
+                                        message: `${title} is required.`,
+                                    },
+                                ]}
+                            >
+                                {/* @ts-ignore */}
+                                <DatePicker showTime={{ format: 'HH:mm' }} onOk={save}/>
+                            </Form.Item>
+                        ) : (
+                            <div className="editable-cell-value-wrap" style={{ paddingRight: 24 }} onClick={toggleEdit}>
+                            {children}
+                            </div>
+                        );
+                    }
+                    return <td {...restProps}>{childNode}</td>;
+                };
+                  
+                class EditableTable extends React.Component {
+                    constructor(props: any) {
+                        super(props);
+                        //@ts-ignore
+                        this.columns = [
+                            {
+                                title: 'Item',
+                                dataIndex: 'item',
+                                width: '30%',
+                                render: (_: string, record: Parse.Object): JSX.Element => <span>{record.get('programItem').get("title")}</span>,
+                                key: 'programItem',
+                            },
+                            {
+                                title: 'Start Time',
+                                dataIndex: 'startTime',
+                                editable: true,
+                                render: (_: string, record: Parse.Object): JSX.Element => <span>{record.get("startTime") ? timezone(record.get("startTime")).tz(timezone.tz.guess()).format("YYYY-MM-DD HH:mm z") : ""}</span>,
+                                key: 'startTime',
+                            },
+                            {
+                                title: 'End Time',
+                                dataIndex: 'endTime',
+                                editable: true,
+                                render: (_: string, record: Parse.Object): JSX.Element => <span>{record.get("endTime") ? timezone(record.get("endTime")).tz(timezone.tz.guess()).format("YYYY-MM-DD HH:mm z") : ""}</span>,
+                                key: 'endTime',
+                            },
+                        ];
+
+                        this.state = {
+                            dataSource: outterRecord.get("events")
+                        };
+
+                    }
+                  
+
+                    //TODO: Save update to Parse database
+                    handleSave = (row: any) => {
+                        //@ts-ignore
+                        const newData = [...this.state.dataSource];
+                        const index = newData.findIndex(sessionEvent => row.key === sessionEvent.key);
+                        
+                       
+                        if (index >= 0) {
+                            const sessionEvent = newData[index];
+
+                            let data = {
+                                clazz: "ProgramSessionEvent",
+                                conference: { clazz: "ClowdrInstance", id: sessionEvent.get("conference").id },
+                                id: sessionEvent.id,
+                                startTime: sessionEvent.get('startTime'),
+                                endTime: sessionEvent.get('endTime'),
+                            };
+
+                            if (row.startTime) {
+                                data.startTime = row.startTime.toDate();
+                                newData[index].set("startTime", row.startTime.toDate());
+                            }
+                            if (row.endTime) {
+                                data.endTime = row.endTime.toDate();   
+                                newData[index].set("endTime", row.endTime.toDate());                                                
+                            }
+
+                            Parse.Cloud.run("update-obj", data)
+                            .then(() => {
+                                this.setState({ alert: "save success" });
+                            })
+                            .catch((err: Error) => {
+                                this.setState({ alert: "save error" });
+                                console.log("[Admin/Sessions-sessionEvent]: Unable to save: " + err);
+                            })
+                        }
+
+                    };
+                  
+                    render() {
+                        //@ts-ignore
+                        const { dataSource } = this.state;
+                        const components = {
+                            body: {
+                                row: EditableRow,
+                                cell: EditableCell,
+                            },
+                        };
+                        //@ts-ignore
+                        const columns = this.columns.map((col: any) => {
+                            if (!col.editable) {
+                            return col;
+                            }
+                            return {
+                                ...col,
+                                onCell: (record: any) => ({
+                                    record,
+                                    editable: col.editable,
+                                    dataIndex: col.dataIndex,
+                                    title: col.title,
+                                    handleSave: this.handleSave,
+                                }),
+                            };
+                        });
+                        return (
+                            <Table
+                                components={components}
+                                rowClassName={() => 'editable-row'}
+                                bordered
+                                dataSource={dataSource}
+                                columns={columns}
+                                pagination={false}
+                            />
+                        );
+                    }
+                }
+                  
+                return <EditableTable />;
+            };
+
             return (
                 <Form form={form} component={false}>
                     <Table
@@ -443,6 +656,7 @@ class ProgramSessions extends React.Component<ProgramSessionsProps, ProgramSessi
                         columns={mergedColumns}
                         rowClassName="editable-row"
                         rowKey='id'
+                        expandable={{expandedRowRender}}
                         pagination={{
                             onChange: cancel,
                         }}
